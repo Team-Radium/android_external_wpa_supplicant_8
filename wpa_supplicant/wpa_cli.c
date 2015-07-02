@@ -1330,6 +1330,14 @@ static int wpa_cli_cmd_list_networks(struct wpa_ctrl *ctrl, int argc,
 	return wpa_ctrl_command(ctrl, "LIST_NETWORKS");
 }
 
+#ifdef CONFIG_EAP_PROXY
+static int wpa_cli_cmd_get_sim_info(struct wpa_ctrl *ctrl, int argc,
+				      char *argv[])
+{
+	return wpa_ctrl_command(ctrl, "GET_SIM_INFO");
+}
+#endif
+
 
 static int wpa_cli_cmd_select_network(struct wpa_ctrl *ctrl, int argc,
 				      char *argv[])
@@ -2576,6 +2584,11 @@ static struct wpa_cli_cmd wpa_cli_commands[] = {
 	{ "list_networks", wpa_cli_cmd_list_networks, NULL,
 	  cli_cmd_flag_none,
 	  "= list configured networks" },
+#ifdef CONFIG_EAP_PROXY
+	{ "GET_SIM_INFO", wpa_cli_cmd_get_sim_info, NULL,
+	  cli_cmd_flag_none,
+	  "= get the SIM card info" },
+#endif
 	{ "select_network", wpa_cli_cmd_select_network, NULL,
 	  cli_cmd_flag_none,
 	  "<network id> = select a network (disable others)" },
@@ -3179,15 +3192,29 @@ static void wpa_cli_action_process(const char *msg)
 {
 	const char *pos;
 	char *copy = NULL, *id, *pos2;
+	const char *ifname = ctrl_ifname;
+	char ifname_buf[100];
 
 	pos = msg;
+	if (os_strncmp(pos, "IFNAME=", 7) == 0) {
+		const char *end;
+		end = os_strchr(pos + 7, ' ');
+		if (end && (unsigned int) (end - pos) < sizeof(ifname_buf)) {
+			pos += 7;
+			os_memcpy(ifname_buf, pos, end - pos);
+			ifname_buf[end - pos] = '\0';
+			ifname = ifname_buf;
+			pos = end + 1;
+		}
+	}
 	if (*pos == '<') {
+		const char *prev = pos;
 		/* skip priority */
 		pos = os_strchr(pos, '>');
 		if (pos)
 			pos++;
 		else
-			pos = msg;
+			pos = prev;
 	}
 
 	if (str_match(pos, WPA_EVENT_CONNECTED)) {
@@ -3224,37 +3251,37 @@ static void wpa_cli_action_process(const char *msg)
 		if (wpa_cli_connected <= 0 || new_id != wpa_cli_last_id) {
 			wpa_cli_connected = 1;
 			wpa_cli_last_id = new_id;
-			wpa_cli_exec(action_file, ctrl_ifname, "CONNECTED");
+			wpa_cli_exec(action_file, ifname, "CONNECTED");
 		}
 	} else if (str_match(pos, WPA_EVENT_DISCONNECTED)) {
 		if (wpa_cli_connected) {
 			wpa_cli_connected = 0;
-			wpa_cli_exec(action_file, ctrl_ifname, "DISCONNECTED");
+			wpa_cli_exec(action_file, ifname, "DISCONNECTED");
 		}
 	} else if (str_match(pos, P2P_EVENT_GROUP_STARTED)) {
-		wpa_cli_exec(action_file, ctrl_ifname, pos);
+		wpa_cli_exec(action_file, ifname, pos);
 	} else if (str_match(pos, P2P_EVENT_GROUP_REMOVED)) {
-		wpa_cli_exec(action_file, ctrl_ifname, pos);
+		wpa_cli_exec(action_file, ifname, pos);
 	} else if (str_match(pos, P2P_EVENT_CROSS_CONNECT_ENABLE)) {
-		wpa_cli_exec(action_file, ctrl_ifname, pos);
+		wpa_cli_exec(action_file, ifname, pos);
 	} else if (str_match(pos, P2P_EVENT_CROSS_CONNECT_DISABLE)) {
-		wpa_cli_exec(action_file, ctrl_ifname, pos);
+		wpa_cli_exec(action_file, ifname, pos);
 	} else if (str_match(pos, P2P_EVENT_GO_NEG_FAILURE)) {
-		wpa_cli_exec(action_file, ctrl_ifname, pos);
+		wpa_cli_exec(action_file, ifname, pos);
 	} else if (str_match(pos, WPS_EVENT_SUCCESS)) {
-		wpa_cli_exec(action_file, ctrl_ifname, pos);
+		wpa_cli_exec(action_file, ifname, pos);
 	} else if (str_match(pos, WPS_EVENT_FAIL)) {
-		wpa_cli_exec(action_file, ctrl_ifname, pos);
+		wpa_cli_exec(action_file, ifname, pos);
 	} else if (str_match(pos, AP_STA_CONNECTED)) {
-		wpa_cli_exec(action_file, ctrl_ifname, pos);
+		wpa_cli_exec(action_file, ifname, pos);
 	} else if (str_match(pos, AP_STA_DISCONNECTED)) {
-		wpa_cli_exec(action_file, ctrl_ifname, pos);
+		wpa_cli_exec(action_file, ifname, pos);
 	} else if (str_match(pos, ESS_DISASSOC_IMMINENT)) {
-		wpa_cli_exec(action_file, ctrl_ifname, pos);
+		wpa_cli_exec(action_file, ifname, pos);
 	} else if (str_match(pos, HS20_SUBSCRIPTION_REMEDIATION)) {
-		wpa_cli_exec(action_file, ctrl_ifname, pos);
+		wpa_cli_exec(action_file, ifname, pos);
 	} else if (str_match(pos, HS20_DEAUTH_IMMINENT_NOTICE)) {
-		wpa_cli_exec(action_file, ctrl_ifname, pos);
+		wpa_cli_exec(action_file, ifname, pos);
 	} else if (str_match(pos, WPA_EVENT_TERMINATING)) {
 		printf("wpa_supplicant is terminating - stop monitoring\n");
 		wpa_cli_quit = 1;
@@ -3386,7 +3413,7 @@ static void wpa_cli_recv_pending(struct wpa_ctrl *ctrl, int action_monitor)
 		return;
 	}
 	while (wpa_ctrl_pending(ctrl) > 0) {
-		char buf[256];
+		char buf[4096];
 		size_t len = sizeof(buf) - 1;
 		if (wpa_ctrl_recv(ctrl, buf, &len) == 0) {
 			buf[len] = '\0';
@@ -3450,10 +3477,18 @@ static int tokenize_cmd(char *cmd, char *argv[])
 
 static void wpa_cli_ping(void *eloop_ctx, void *timeout_ctx)
 {
-	if (ctrl_conn && _wpa_ctrl_command(ctrl_conn, "PING", 0)) {
-		printf("Connection to wpa_supplicant lost - trying to "
-		       "reconnect\n");
-		wpa_cli_close_connection();
+	if (ctrl_conn) {
+		int res;
+		char *prefix = ifname_prefix;
+
+		ifname_prefix = NULL;
+		res = _wpa_ctrl_command(ctrl_conn, "PING", 0);
+		ifname_prefix = prefix;
+		if (res) {
+			printf("Connection to wpa_supplicant lost - trying to "
+			       "reconnect\n");
+			wpa_cli_close_connection();
+		}
 	}
 	if (!ctrl_conn)
 		wpa_cli_reconnect();

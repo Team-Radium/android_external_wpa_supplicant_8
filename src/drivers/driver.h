@@ -411,6 +411,25 @@ enum wps_mode {
 			  */
 };
 
+struct hostapd_freq_params {
+	int mode;
+	int freq;
+	int channel;
+	/* for HT */
+	int ht_enabled;
+	int sec_channel_offset; /* 0 = HT40 disabled, -1 = HT40 enabled,
+				 * secondary channel below primary, 1 = HT40
+				 * enabled, secondary channel above primary */
+
+	/* for VHT */
+	int vht_enabled;
+
+	/* valid for both HT and VHT, center_freq2 is non-zero
+	 * only for bandwidth 80 and an 80+80 channel */
+	int center_freq1, center_freq2;
+	int bandwidth;
+};
+
 /**
  * struct wpa_driver_associate_params - Association parameters
  * Data for struct wpa_driver_ops::associate().
@@ -443,11 +462,9 @@ struct wpa_driver_associate_params {
 	size_t ssid_len;
 
 	/**
-	 * freq - Frequency of the channel the selected AP is using
-	 * Frequency that the selected AP is using (in MHz as
-	 * reported in the scan results)
+	 * freq - channel parameters
 	 */
-	int freq;
+	struct hostapd_freq_params freq;
 
 	/**
 	 * freq_hint - Frequency of the channel the proposed AP is using
@@ -1005,13 +1022,17 @@ struct wpa_driver_capa {
 #define WPA_DRIVER_FLAGS_IBSS				0x08000000
 /* Driver supports radar detection */
 #define WPA_DRIVER_FLAGS_RADAR				0x10000000
+/* Driver support ACS offload */
+#define WPA_DRIVER_FLAGS_ACS_OFFLOAD		0x0000000200000000ULL
 /* Driver supports a dedicated interface for P2P Device */
 #define WPA_DRIVER_FLAGS_DEDICATED_P2P_DEVICE		0x20000000
 /* Driver supports QoS Mapping */
 #define WPA_DRIVER_FLAGS_QOS_MAPPING			0x40000000
 /* Driver supports CSA in AP mode */
 #define WPA_DRIVER_FLAGS_AP_CSA				0x80000000
-	unsigned int flags;
+/* Driver supports mesh */
+#define WPA_DRIVER_FLAGS_MESH			0x0000000100000000ULL
+	u64 flags;
 
 	int max_scan_ssids;
 	int max_sched_scan_ssids;
@@ -1120,25 +1141,6 @@ struct hostapd_sta_add_params {
 	size_t supp_channels_len;
 	const u8 *supp_oper_classes;
 	size_t supp_oper_classes_len;
-};
-
-struct hostapd_freq_params {
-	int mode;
-	int freq;
-	int channel;
-	/* for HT */
-	int ht_enabled;
-	int sec_channel_offset; /* 0 = HT40 disabled, -1 = HT40 enabled,
-				 * secondary channel below primary, 1 = HT40
-				 * enabled, secondary channel above primary */
-
-	/* for VHT */
-	int vht_enabled;
-
-	/* valid for both HT and VHT, center_freq2 is non-zero
-	 * only for bandwidth 80 and an 80+80 channel */
-	int center_freq1, center_freq2;
-	int bandwidth;
 };
 
 struct mac_address {
@@ -1351,6 +1353,17 @@ struct macsec_init_params {
 	Boolean use_scb;
 };
 #endif /* CONFIG_MACSEC */
+
+struct drv_acs_params {
+	/* Selected mode (HOSTAPD_MODE_*) */
+	enum hostapd_hw_mode hw_mode;
+
+	/* Indicates whether HT is enabled */
+	int ht_enabled;
+
+	/* Indicates whether HT40 is enabled */
+	int ht40_enabled;
+};
 
 
 /**
@@ -2534,6 +2547,7 @@ struct wpa_driver_ops {
 	 * @dialog_token: Dialog Token to use in the message (if needed)
 	 * @status_code: Status Code or Reason Code to use (if needed)
 	 * @peer_capab: TDLS peer capability (TDLS_PEER_* bitfield)
+	 * @initiator: Is the current end the TDLS link initiator
 	 * @buf: TDLS IEs to add to the message
 	 * @len: Length of buf in octets
 	 * Returns: 0 on success, negative (<0) on failure
@@ -2543,7 +2557,7 @@ struct wpa_driver_ops {
 	 */
 	int (*send_tdls_mgmt)(void *priv, const u8 *dst, u8 action_code,
 			      u8 dialog_token, u16 status_code, u32 peer_capab,
-			      const u8 *buf, size_t len);
+			      int initiator, const u8 *buf, size_t len);
 
 	/**
 	 * tdls_oper - Ask the driver to perform high-level TDLS operations
@@ -2835,6 +2849,30 @@ struct wpa_driver_ops {
 	 */
 	int (*status)(void *priv, char *buf, size_t buflen);
 
+	/**
+	 * roaming - Set roaming policy for driver-based BSS selection
+	 * @priv: Private driver interface data
+	 * @allowed: Whether roaming within ESS is allowed
+	 * @bssid: Forced BSSID if roaming is disabled or %NULL if not set
+	 * Returns: Length of written status information or -1 on failure
+	 *
+	 * This optional callback can be used to update roaming policy from the
+	 * associate() command (bssid being set there indicates that the driver
+	 * should not roam before getting this roaming() call to allow roaming.
+	 * If the driver does not indicate WPA_DRIVER_FLAGS_BSS_SELECTION
+	 * capability, roaming policy is handled within wpa_supplicant and there
+	 * is no need to implement or react to this callback.
+	 */
+	int (*roaming)(void *priv, int allowed, const u8 *bssid);
+
+	/**
+	 * set_mac_addr - Set MAC address
+	 * @priv: Private driver interface data
+	 * @addr: MAC address to use or %NULL for setting back to permanent
+	 * Returns: 0 on success, -1 on failure
+	 */
+	int (*set_mac_addr)(void *priv, const u8 *addr);
+
 #ifdef CONFIG_MACSEC
 	int (*macsec_init)(void *priv, struct macsec_init_params *params);
 
@@ -3044,6 +3082,17 @@ struct wpa_driver_ops {
 	 * already established PMKSA.
 	 */
 	int (*key_mgmt_set_pmk)(void *priv, const u8 *pmk, size_t pmk_len);
+
+        /**
+	 * do_acs - Automatically select channel
+	 * @priv: Private driver interface data
+	 * @params: Parameters for ACS
+	 * Returns 0 on success, -1 on failure
+	 *
+	 * This command can be used to offload ACS to the driver if the driver
+	 * indicates support for such offloading (WPA_DRIVER_FLAGS_ACS_OFFLOAD).
+	 */
+	int (*do_acs)(void *priv, struct drv_acs_params *params);
 };
 
 
@@ -3532,7 +3581,15 @@ enum wpa_event_type {
 	 *  event might also be sent after the device handles a PTK rekeying
 	 *  operation.
 	 */
-	EVENT_AUTHORIZATION
+	EVENT_AUTHORIZATION,
+
+        /**
+	 * EVENT_ACS_CHANNEL_SELECTED - Received selected channels by ACS
+	 *
+	 * Indicates a pair of primary and secondary channels chosen by ACS
+	 * in device.
+	 */
+	EVENT_ACS_CHANNEL_SELECTED
 };
 
 
@@ -4191,6 +4248,16 @@ union wpa_event_data {
 		u8 *ptk_kck;
 		u8 *ptk_kek;
 	} authorization_info;
+
+        /**
+	 * struct acs_selected_channels - Data for EVENT_ACS_CHANNEL_SELECTED
+	 * @pri_channel: Selected primary channel
+	 * @sec_channel: Selected secondary channel
+	 */
+	struct acs_selected_channels {
+		u8 pri_channel;
+		u8 sec_channel;
+	} acs_selected_channels;
 };
 
 /**
@@ -4248,6 +4315,9 @@ void wpa_scan_results_free(struct wpa_scan_results *res);
 
 /* Convert wpa_event_type to a string for logging */
 const char * event_to_string(enum wpa_event_type event);
+
+/* Convert chan_width to a string for logging and control interfaces */
+const char * channel_width_to_string(enum chan_width width);
 
 /* NULL terminated array of linked in driver wrappers */
 extern struct wpa_driver_ops *wpa_drivers[];
